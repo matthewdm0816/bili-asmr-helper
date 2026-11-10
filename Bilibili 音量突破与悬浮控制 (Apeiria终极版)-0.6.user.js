@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 音量突破与悬浮控制 (Apeiria终极版)
 // @namespace    http://tampermonkey.net/
-// @version      0.6
+// @version      0.7
 // @description  突破B站音量限制，修复音频劫持导致的无声问题，竖版悬浮音量条 + A-B时间段循环，Apeiria全程护航！
 // @author       Apeiria
 // @match        *://*.bilibili.com/video/*
@@ -16,7 +16,49 @@
 
     let globalAudioCtx = null;
     let globalGainNode = null;
-    let currentVolume = 1.0;
+    let globalLimiter = null;
+    let currentVolume = 1.0; // linear multiplier fed to GainNode
+
+    // Slider works in dB; GainNode itself is a linear multiplier: gain = 10^(dB/20)
+    function dbToGain(db) {
+        return Math.pow(10, db / 20);
+    }
+
+    // Peak limiter after the gain stage. Without it, samples beyond ±1.0 are hard-clipped by the
+    // output device, which is the crackling heard at high gain.
+    // DynamicsCompressorNode applies automatic makeup gain (Web Audio spec: (1 / curve(0 dBFS))^0.6),
+    // which would push peaks back up, so a trailing GainNode cancels it.
+    // The compressor cannot catch very short transients (e.g. single-sample clicks), so a final
+    // WaveShaper soft clipper catches the residue: identity below 0.8, smooth saturation towards 1.0 above.
+    const LIMITER_THRESHOLD_DB = -6;
+    const LIMITER_RATIO = 20;
+    const SHAPER_RANGE = 4; // shaper input is pre-scaled by 1/SHAPER_RANGE so it covers ±4.0
+    function softClip(y) {
+        const a = Math.abs(y);
+        if (a <= 0.8) return y;
+        return Math.sign(y) * (0.8 + 0.2 * Math.tanh((a - 0.8) / 0.2));
+    }
+    function createLimiter(ctx) {
+        const comp = ctx.createDynamicsCompressor();
+        comp.threshold.value = LIMITER_THRESHOLD_DB;
+        comp.knee.value = 0;
+        comp.ratio.value = LIMITER_RATIO;
+        comp.attack.value = 0;
+        comp.release.value = 0.2;
+        const curveAt0dB = LIMITER_THRESHOLD_DB * (1 - 1 / LIMITER_RATIO);
+        const makeupCancel = ctx.createGain();
+        makeupCancel.gain.value = Math.pow(10, curveAt0dB * 0.6 / 20) / SHAPER_RANGE;
+        const shaper = ctx.createWaveShaper();
+        const curve = new Float32Array(4097);
+        for (let i = 0; i < curve.length; i++) {
+            curve[i] = softClip((i / (curve.length - 1) * 2 - 1) * SHAPER_RANGE);
+        }
+        shaper.curve = curve;
+        comp.connect(makeupCancel);
+        makeupCancel.connect(shaper);
+        shaper.connect(ctx.destination);
+        return comp;
+    }
 
     // 1. 制造Apeiria的魔法悬浮窗 UI（竖排版：标签在上、滑条居中、按钮垫底）
     const container = document.createElement('div');
@@ -62,10 +104,10 @@
     const slider = document.createElement('input');
     slider.type = 'range';
     slider.setAttribute('orient', 'vertical'); // Firefox 认这个属性，Chrome 会无视，两边都兼容
-    slider.min = '0.5';
-    slider.max = '20.0';
-    slider.step = '0.1';
-    slider.value = '1.0';
+    slider.min = '-6';  // ≈ ×0.5
+    slider.max = '26';  // ≈ ×20
+    slider.step = '0.5';
+    slider.value = '0';
     slider.style.cssText = `
         writing-mode: vertical-lr;
         direction: rtl;
@@ -76,7 +118,6 @@
     `;
 
     const label = document.createElement('span');
-    label.innerText = '100%';
     label.style.cssText = `
         margin-bottom: 6px;
         color: #fb7299;
@@ -84,6 +125,12 @@
         font-size: 12px;
         text-align: center;
     `;
+
+    function updateVolumeLabel(db) {
+        const sign = db > 0 ? '+' : '';
+        label.innerText = sign + db.toFixed(1) + ' dB\n×' + dbToGain(db).toFixed(1);
+    }
+    updateVolumeLabel(0);
 
     sliderWrapper.appendChild(label);
     sliderWrapper.appendChild(slider);
@@ -275,6 +322,7 @@
             try {
                 if (!globalAudioCtx) {
                     globalAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                    globalLimiter = createLimiter(globalAudioCtx);
                 }
                 const source = globalAudioCtx.createMediaElementSource(video);
                 globalGainNode = globalAudioCtx.createGain();
@@ -282,7 +330,7 @@
                 globalGainNode.gain.value = currentVolume;
 
                 source.connect(globalGainNode);
-                globalGainNode.connect(globalAudioCtx.destination);
+                globalGainNode.connect(globalLimiter);
 
                 video.dataset.apeiriaHooked = "true";
                 console.log("[Apeiria] 叮咚！成功接管音频张量！✨");
@@ -315,11 +363,13 @@
     };
 
     slider.oninput = (e) => {
-        currentVolume = parseFloat(e.target.value);
-        label.innerText = Math.round(currentVolume * 100) + '%';
+        const db = parseFloat(e.target.value);
+        currentVolume = dbToGain(db);
+        updateVolumeLabel(db);
 
         if (globalGainNode) {
-            globalGainNode.gain.value = currentVolume;
+            // Smooth ramp (30 ms time constant) instead of a step change, avoids clicks while dragging
+            globalGainNode.gain.setTargetAtTime(currentVolume, globalAudioCtx.currentTime, 0.03);
         }
         hookAudio();
     };
